@@ -8,8 +8,9 @@ import torch.nn as nn
 from sklearn.metrics import accuracy_score
 from sklearn.utils import shuffle
 
-from analysis import rocstories as rocstories_analysis
-from datasets import rocstories
+from analysis import msrpc as msrpc_analysis
+from datasets import msrpc
+
 from model_pytorch import DoubleHeadModel, load_openai_pretrained_model
 from opt import OpenAIAdam
 from text_utils import TextEncoder
@@ -17,21 +18,21 @@ from utils import (encode_dataset, iter_data,
                    ResultLogger, make_path)
 from loss import MultipleChoiceLossCompute
 
-def transform_roc(X1, X2, X3):
+def transform_paraphrase(X1, X2):
     n_batch = len(X1)
     xmb = np.zeros((n_batch, 2, n_ctx, 2), dtype=np.int32)
     mmb = np.zeros((n_batch, 2, n_ctx), dtype=np.float32)
     start = encoder['_start_']
     delimiter = encoder['_delimiter_']
-    for i, (x1, x2, x3), in enumerate(zip(X1, X2, X3)):
+    for i, (x1, x2), in enumerate(zip(X1, X2)):
         x12 = [start] + x1[:max_len] + [delimiter] + x2[:max_len] + [clf_token]
-        x13 = [start] + x1[:max_len] + [delimiter] + x3[:max_len] + [clf_token]
+        x21 = [start] + x2[:max_len] + [delimiter] + x1[:max_len] + [clf_token]
         l12 = len(x12)
-        l13 = len(x13)
+        l21 = len(x21)
         xmb[i, 0, :l12, 0] = x12
-        xmb[i, 1, :l13, 0] = x13
+        xmb[i, 1, :l21, 0] = x21
         mmb[i, 0, :l12] = 1
-        mmb[i, 1, :l13] = 1
+        mmb[i, 1, :l21] = 1
     # Position information that is added to the input embeddings in the TransformerModel
     xmb[:, :, :, 1] = np.arange(n_vocab + n_special, n_vocab + n_special + n_ctx)
     return xmb, mmb
@@ -151,10 +152,10 @@ if __name__ == '__main__':
     parser.add_argument('--max_grad_norm', type=int, default=1)
     parser.add_argument('--lr', type=float, default=6.25e-5)
     parser.add_argument('--lr_warmup', type=float, default=0.002)
-    parser.add_argument('--n_ctx', type=int, default=512)
-    parser.add_argument('--n_embd', type=int, default=768)
-    parser.add_argument('--n_head', type=int, default=12)
-    parser.add_argument('--n_layer', type=int, default=12)
+    parser.add_argument('--n_ctx', type=int, default=512)   # transformer-lm param
+    parser.add_argument('--n_embd', type=int, default=768)  # transformer-lm param
+    parser.add_argument('--n_head', type=int, default=12)   # transformer-lm param
+    parser.add_argument('--n_layer', type=int, default=12)  # transformer-lm param
     parser.add_argument('--embd_pdrop', type=float, default=0.1)
     parser.add_argument('--attn_pdrop', type=float, default=0.1)
     parser.add_argument('--resid_pdrop', type=float, default=0.1)
@@ -172,7 +173,10 @@ if __name__ == '__main__':
     parser.add_argument('--b2', type=float, default=0.999)
     parser.add_argument('--e', type=float, default=1e-8)
     parser.add_argument('--n_valid', type=int, default=374)
-
+    
+    # n_transfer is the number of pre-trained layers that we will be loaded, the next ones will be initialized randomly.
+    # n_embd is the dimension of the embedding and of the vector associated to each position in the network. It has the value 768 because the network uses multi-head attention with 12 heads and 768 = 12 * 64
+    
     args = parser.parse_args()
     print(args)
 
@@ -201,10 +205,10 @@ if __name__ == '__main__':
     n_vocab = len(text_encoder.encoder)
 
     print("Encoding dataset...")
-    ((trX1, trX2, trX3, trY),
-     (vaX1, vaX2, vaX3, vaY),
-     (teX1, teX2, teX3)) = encode_dataset(*rocstories(data_dir, n_valid=args.n_valid),
-                                          encoder=text_encoder)
+    ((trS1, trS2, trY),
+    (vaS1, vaS2, vaY),
+    (teS1, teS2)) = encode_dataset(*msrpc(data_dir, n_valid=args.n_valid),
+                                        encoder=text_encoder)
     encoder['_start_'] = len(encoder)
     encoder['_delimiter_'] = len(encoder)
     encoder['_classify_'] = len(encoder)
@@ -212,18 +216,22 @@ if __name__ == '__main__':
     n_special = 3
     max_len = n_ctx // 2 - 2
     n_ctx = min(max(
-        [len(x1[:max_len]) + max(len(x2[:max_len]),
-                                 len(x3[:max_len])) for x1, x2, x3 in zip(trX1, trX2, trX3)]
-        + [len(x1[:max_len]) + max(len(x2[:max_len]),
-                                   len(x3[:max_len])) for x1, x2, x3 in zip(vaX1, vaX2, vaX3)]
-        + [len(x1[:max_len]) + max(len(x2[:max_len]),
-                                   len(x3[:max_len])) for x1, x2, x3 in zip(teX1, teX2, teX3)]
+        [len(s1[:max_len]) + len(s2[:max_len]) for s1, s2 in zip(trS1, trS2)]
+        + [len(s1[:max_len]) + len(s2[:max_len]) for s1, s2 in zip(vaS1, vaS2)]
+        + [len(s1[:max_len]) + len(s2[:max_len]) for s1, s2 in zip(teS1, teS2)]
         ) + 3, n_ctx)
+    
+    # n_ctx is the maximum number of token in an input sequence.
+    # n_special is the number of special tokens used to format the input properly. For example in the ROCStories problem, we use 3 additional tokens, start, delimiter and classify
+    # n_vocab should be the actual valid tokens
+
     vocab = n_vocab + n_special + n_ctx
-    trX, trM = transform_roc(trX1, trX2, trX3)
-    vaX, vaM = transform_roc(vaX1, vaX2, vaX3)
+    # The reason for adding is that each token in a sentence should also has a position encoding(here, position embedding is used, similar to word embedding
+
+    trX, trM = transform_paraphrase(trS1, trS2)
+    vaX, vaM = transform_paraphrase(vaS1, vaS2)
     if submit:
-        teX, teM = transform_roc(teX1, teX2, teX3)
+        teX, teM = transform_paraphrase(teS1, teS2)
 
     n_train = len(trY)
     n_valid = len(vaY)
@@ -271,5 +279,5 @@ if __name__ == '__main__':
         dh_model.load_state_dict(torch.load(path))
         predict(dataset, args.submission_dir)
         if args.analysis:
-            rocstories_analysis(data_dir, os.path.join(args.submission_dir, 'ROCStories.tsv'),
-                                os.path.join(log_dir, 'rocstories.jsonl'))
+            msrpc_analysis(data_dir, os.path.join(args.submission_dir, 'msrpc.tsv'),
+                                os.path.join(log_dir, 'msrpc.jsonl'))
