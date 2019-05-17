@@ -12,7 +12,9 @@ seed = 3535999445
 # MSR Paraphrase Corpus
 def _msrpc(path):
     with open(path, encoding='utf_8') as f:
-        f = csv.reader(f, delimiter='\t')
+        f = f.readlines()
+        for i, line in enumerate(f):
+            f[i] = f[i].strip().split('\t')
         s1 = [] # string 1
         s2 = [] # string 2
         y = []  # label/quality (0 or 1)
